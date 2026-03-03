@@ -41,6 +41,11 @@ async function getFreshPath(fileId) {
   return res.data.result.file_path;
 }
 
+// This handles the "GET" request from your browser or Cron-job.org
+app.get("/", (req, res) => {
+  res.send("Bot is awake and running! 🚀");
+});
+
 app.post("/", async (req, res) => {
   const update = req.body;
   if (!update.message) return res.sendStatus(200);
