@@ -1,1 +1,17 @@
-
+{
+  "files": [
+    {
+      "name": "A",
+      "telegram_file_id": "BQACAgQAAyEFAATlqCwhAAMUaadQbyWa2XElHHG9e_GAoZ4fMvIAAtkfAALq-DhR3Za2qyj30_86BA",
+      "telegram_file_unique_id": "AgAD2R8AAur4OFE",
+      "telegram_file_path": "documents/file_2",
+      "mime_type": null,
+      "file_size": 1493923,
+      "message_id": 20,
+      "created_at": "2026-03-03T21:19:45.286Z",
+      "updated_at": "2026-03-03T21:19:45.286Z",
+      "last_checked_at": "2026-03-03T21:19:45.286Z",
+      "refresh_count": 0
+    }
+  ]
+}
