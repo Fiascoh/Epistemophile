@@ -23,13 +23,42 @@ async function getGitHubFile(filePath) {
         Accept: "application/vnd.github+json"
       }
     });
+    
+    // Handle empty file (content is empty string or whitespace)
+    if (!res.data.content || res.data.content.trim() === "") {
+      console.log(`[GitHub] ${filePath} is empty, initializing`);
+      return { data: { files: [] }, sha: res.data.sha };
+    }
+    
     const content = Buffer.from(res.data.content, "base64").toString("utf-8");
+    
+    // Handle whitespace-only content
+    if (content.trim() === "") {
+      return { data: { files: [] }, sha: res.data.sha };
+    }
+    
     return { data: JSON.parse(content), sha: res.data.sha };
+    
   } catch (err) {
     if (err.response?.status === 404) {
       console.log(`[GitHub] ${filePath} not found, initializing empty`);
       return { data: { files: [] }, sha: null };
     }
+    
+    // Handle JSON parse errors specifically
+    if (err instanceof SyntaxError) {
+      console.error(`[GitHub] ${filePath} contains invalid JSON, resetting`);
+      // Try to get sha even if content is bad, so we can overwrite it
+      try {
+        const res = await axios.get(`${apiUrl}?ref=${BRANCH}`, {
+          headers: { Authorization: `Bearer ${GITHUB_TOKEN}` }
+        });
+        return { data: { files: [] }, sha: res.data.sha };
+      } catch (shaErr) {
+        return { data: { files: [] }, sha: null };
+      }
+    }
+    
     console.error(`[GitHub] Failed to fetch ${filePath}:`, err.response?.data?.message || err.message);
     throw new Error(`GitHub fetch failed for ${filePath}: ${err.message}`);
   }
@@ -57,7 +86,6 @@ async function updateGitHubFile(filePath, data, sha, message) {
 /* ============================= */
 
 async function updateBothFiles(manifest, manifestSha, duplicates, dupSha, operation) {
-  // Try to update both, with rollback consideration
   let manifestUpdated = false;
   
   try {
@@ -66,10 +94,8 @@ async function updateBothFiles(manifest, manifestSha, duplicates, dupSha, operat
     await updateGitHubFile("duplicates.json", { files: duplicates }, dupSha, `${operation} duplicates`);
     return { success: true };
   } catch (err) {
-    // If manifest succeeded but duplicates failed, we're in inconsistent state
     if (manifestUpdated) {
       console.error("[CRITICAL] Inconsistent state: manifest updated but duplicates failed");
-      // Could implement rollback here, but GitHub doesn't support true transactions
     }
     throw err;
   }
@@ -105,17 +131,18 @@ async function forwardMessageSafely(chatId, fromChatId, messageId) {
     return res.data.result;
   } catch (err) {
     console.error(`[Telegram] Forward failed from ${fromChatId}/${messageId}:`, err.response?.data?.description || err.message);
-    return null; // Graceful fallback
+    return null;
   }
 }
 
-async function sendMessage(chatId, text) {
+async function sendMessage(chatId, text, options = {}) {
   try {
     await axios.post(`${TELEGRAM_API}/sendMessage`, {
       chat_id: chatId,
-      text: text.slice(0, 4096), // Telegram limit
+      text: text.slice(0, 4096),
       parse_mode: "HTML",
-      disable_web_page_preview: true
+      disable_web_page_preview: true,
+      ...options
     });
   } catch (err) {
     console.error(`[Telegram] sendMessage failed:`, err.response?.data?.description || err.message);
@@ -133,7 +160,6 @@ function findExistingFile(manifest, duplicates, uniqueId, fileName, fileSize) {
   const inDuplicates = duplicates.find(f => f.telegram_file_unique_id === uniqueId);
   if (inDuplicates) return { location: 'duplicates', file: inDuplicates, index: duplicates.indexOf(inDuplicates) };
   
-  // Check name+size match (possible re-upload)
   const nameSizeMatch = manifest.find(f => f.name === fileName && f.file_size === fileSize);
   if (nameSizeMatch) return { location: 'manifest-name-match', file: nameSizeMatch, index: manifest.indexOf(nameSizeMatch) };
   
@@ -182,11 +208,9 @@ app.post("/", async (req, res) => {
   const text = msg.text || msg.caption || "";
   const fileObject = msg.document || msg.audio || msg.video || msg.video_note || msg.voice;
   
-  // Immediate ack to Telegram
   res.sendStatus(200);
   
   try {
-    // Load both manifests
     const [{ data: manifestData, sha: manifestSha }, { data: dupData, sha: dupSha }] = await Promise.all([
       getGitHubFile("manifest.json"),
       getGitHubFile("duplicates.json")
@@ -204,9 +228,7 @@ app.post("/", async (req, res) => {
     if (fileObject || urlMatch) {
       let targetFile = fileObject;
       let originMessageId = msg.message_id;
-      let forwardFailed = false;
       
-      // Handle t.me links by forwarding
       if (urlMatch && !fileObject) {
         const [, channelUsername, messageIdStr] = urlMatch;
         const messageId = parseInt(messageIdStr, 10);
@@ -217,8 +239,8 @@ app.post("/", async (req, res) => {
           targetFile = forwarded.document || forwarded.audio || forwarded.video || forwarded.video_note || forwarded.voice;
           originMessageId = forwarded.message_id;
         } else {
-          forwardFailed = true;
           await sendMessage(chatId, "⚠️ Could not forward message. Ensure the bot is in the channel and message exists.");
+          return;
         }
       }
       
@@ -234,7 +256,6 @@ app.post("/", async (req, res) => {
         let responseText;
         
         if (existing?.location === 'manifest') {
-          // Refresh existing
           existing.file.telegram_file_path = filePath;
           existing.file.last_checked_at = new Date().toISOString();
           existing.file.refresh_count = (existing.file.refresh_count || 0) + 1;
@@ -244,7 +265,6 @@ app.post("/", async (req, res) => {
           responseText = `🔄 <b>Existing File Refreshed</b>\n\nName: ${escapeHtml(existing.file.name)}\nRefreshed: ${existing.file.refresh_count} times`;
           
         } else if (existing?.location === 'duplicates') {
-          // Move from duplicates back to manifest (file re-appeared)
           const [restored] = duplicates.splice(existing.index, 1);
           restored.telegram_file_path = filePath;
           restored.message_id = originMessageId;
@@ -256,7 +276,6 @@ app.post("/", async (req, res) => {
           responseText = `♻️ <b>File Restored from Duplicates</b>\n\nName: ${escapeHtml(restored.name)}`;
           
         } else if (existing?.location === 'manifest-name-match') {
-          // Same name/size, different unique_id = likely modified file
           duplicates.push({
             ...createFileEntry(targetFile, filePath, originMessageId),
             duplicate_reason: "name_size_match",
@@ -267,13 +286,11 @@ app.post("/", async (req, res) => {
           responseText = `⚠️ <b>Possible Duplicate Detected</b>\n\nName: ${escapeHtml(fileName)}\nStatus: Moved to duplicates (same name/size, different ID)`;
           
         } else {
-          // Truly new file
           manifest.push(createFileEntry(targetFile, filePath, originMessageId));
           operation = "Add new";
           responseText = `✅ <b>New File Added</b>\n\nName: ${escapeHtml(fileName)}\nSize: ${formatBytes(fileSize)}`;
         }
         
-        // Atomic update
         await updateBothFiles(manifest, manifestSha, duplicates, dupSha, operation);
         
         const directLink = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
@@ -329,8 +346,21 @@ app.post("/", async (req, res) => {
         const list = duplicates.slice(0, 10).map((d, i) => 
           `${i + 1}. ${escapeHtml(d.name)} (${d.duplicate_reason || 'unknown'})`
         ).join("\n");
-        await sendMessage(chatId, `⚠️ <b>Recent Duplicates</b>\n\n${list}${duplicates.length > 10 ? `\n\n...and ${duplicates.length - 10} more` : ''}`);
+        await sendMessage(chatId, `⚠️ <b>Recent Duplicates</b> (${duplicates.length} total)\n\n${list}${duplicates.length > 10 ? `\n\n...and ${duplicates.length - 10} more` : ''}`);
       }
+    }
+    
+    else if (text === "/help") {
+      await sendMessage(chatId, 
+        `📖 <b>Commands</b>\n\n` +
+        `/github or /status - Show repository stats\n` +
+        `/duplicates - List tracked duplicates\n` +
+        `/help - Show this message\n\n` +
+        `<b>Usage:</b>\n` +
+        `• Send file directly to add it\n` +
+        `• Send t.me link to import from channel\n` +
+        `• Type filename to refresh its download link`
+      );
     }
     
   } catch (err) {
@@ -344,6 +374,7 @@ app.post("/", async (req, res) => {
 /* ============================= */
 
 function escapeHtml(text) {
+  if (!text) return "";
   return text
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -367,4 +398,6 @@ app.listen(PORT, () => {
   console.log(`🚀 Bot running on port ${PORT}`);
   console.log(`📁 Repo: ${GITHUB_USERNAME}/${REPO_NAME}`);
   console.log(`🌿 Branch: ${BRANCH}`);
+  console.log(`🤖 Bot API: ${BOT_TOKEN ? "Configured" : "MISSING"}`);
+  console.log(`🔑 GitHub Token: ${GITHUB_TOKEN ? "Configured" : "MISSING"}`);
 });
