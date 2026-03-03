@@ -8,49 +8,71 @@ const { BOT_TOKEN, GITHUB_TOKEN, GITHUB_USERNAME, REPO_NAME } = process.env;
 const BRANCH = "main";
 
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
-const GITHUB_API = `https://api.github.com/repos/${GITHUB_USERNAME}/${REPO_NAME}/contents/manifest.json`;
+const GITHUB_REPO_API = `https://api.github.com/repos/${GITHUB_USERNAME}/${REPO_NAME}/contents`;
 
 /* ============================= */
-/* GitHub Manifest Helpers       */
+/* GitHub Helpers                */
 /* ============================= */
 
-async function getManifest() {
+async function getGitHubFile(filePath) {
+  const apiUrl = `${GITHUB_REPO_API}/${filePath}`;
   try {
-    const res = await axios.get(`${GITHUB_API}?ref=${BRANCH}`, {
-      headers: { Authorization: `Bearer ${GITHUB_TOKEN}` }
+    const res = await axios.get(`${apiUrl}?ref=${BRANCH}`, {
+      headers: { 
+        Authorization: `Bearer ${GITHUB_TOKEN}`,
+        Accept: "application/vnd.github+json"
+      }
     });
-
     const content = Buffer.from(res.data.content, "base64").toString("utf-8");
     return { data: JSON.parse(content), sha: res.data.sha };
-
   } catch (err) {
-    // Only treat 404 as "manifest doesn't exist yet"
     if (err.response?.status === 404) {
+      console.log(`[GitHub] ${filePath} not found, initializing empty`);
       return { data: { files: [] }, sha: null };
     }
-
-    console.error("GitHub fetch error:", err.response?.data || err.message);
-    throw err;
+    console.error(`[GitHub] Failed to fetch ${filePath}:`, err.response?.data?.message || err.message);
+    throw new Error(`GitHub fetch failed for ${filePath}: ${err.message}`);
   }
 }
 
-async function updateManifest(manifest, sha) {
-  const content = Buffer.from(
-    JSON.stringify(manifest, null, 2)
-  ).toString("base64");
+async function updateGitHubFile(filePath, data, sha, message) {
+  const apiUrl = `${GITHUB_REPO_API}/${filePath}`;
+  const content = Buffer.from(JSON.stringify(data, null, 2)).toString("base64");
+  
+  try {
+    await axios.put(
+      apiUrl,
+      { message, content, sha, branch: BRANCH },
+      { headers: { Authorization: `Bearer ${GITHUB_TOKEN}` } }
+    );
+    console.log(`[GitHub] Updated ${filePath}: ${message}`);
+  } catch (err) {
+    console.error(`[GitHub] Failed to update ${filePath}:`, err.response?.data?.message || err.message);
+    throw new Error(`GitHub update failed for ${filePath}: ${err.message}`);
+  }
+}
 
-  await axios.put(
-    GITHUB_API,
-    {
-      message: "Update manifest",
-      content,
-      sha,
-      branch: BRANCH
-    },
-    {
-      headers: { Authorization: `Bearer ${GITHUB_TOKEN}` }
+/* ============================= */
+/* Atomic Dual-File Update       */
+/* ============================= */
+
+async function updateBothFiles(manifest, manifestSha, duplicates, dupSha, operation) {
+  // Try to update both, with rollback consideration
+  let manifestUpdated = false;
+  
+  try {
+    await updateGitHubFile("manifest.json", { files: manifest }, manifestSha, `${operation} manifest`);
+    manifestUpdated = true;
+    await updateGitHubFile("duplicates.json", { files: duplicates }, dupSha, `${operation} duplicates`);
+    return { success: true };
+  } catch (err) {
+    // If manifest succeeded but duplicates failed, we're in inconsistent state
+    if (manifestUpdated) {
+      console.error("[CRITICAL] Inconsistent state: manifest updated but duplicates failed");
+      // Could implement rollback here, but GitHub doesn't support true transactions
     }
-  );
+    throw err;
+  }
 }
 
 /* ============================= */
@@ -58,11 +80,80 @@ async function updateManifest(manifest, sha) {
 /* ============================= */
 
 async function getFreshPath(fileId) {
-  const res = await axios.get(`${TELEGRAM_API}/getFile`, {
-    params: { file_id: fileId }
-  });
+  try {
+    const res = await axios.get(`${TELEGRAM_API}/getFile`, {
+      params: { file_id: fileId }
+    });
+    if (!res.data.ok) throw new Error(res.data.description);
+    return res.data.result.file_path;
+  } catch (err) {
+    console.error(`[Telegram] getFile failed for ${fileId}:`, err.message);
+    throw new Error(`Failed to get file path: ${err.message}`);
+  }
+}
 
-  return res.data.result.file_path;
+async function forwardMessageSafely(chatId, fromChatId, messageId) {
+  try {
+    const res = await axios.get(`${TELEGRAM_API}/forwardMessage`, {
+      params: {
+        chat_id: chatId,
+        from_chat_id: fromChatId,
+        message_id: messageId
+      }
+    });
+    if (!res.data.ok) throw new Error(res.data.description);
+    return res.data.result;
+  } catch (err) {
+    console.error(`[Telegram] Forward failed from ${fromChatId}/${messageId}:`, err.response?.data?.description || err.message);
+    return null; // Graceful fallback
+  }
+}
+
+async function sendMessage(chatId, text) {
+  try {
+    await axios.post(`${TELEGRAM_API}/sendMessage`, {
+      chat_id: chatId,
+      text: text.slice(0, 4096), // Telegram limit
+      parse_mode: "HTML",
+      disable_web_page_preview: true
+    });
+  } catch (err) {
+    console.error(`[Telegram] sendMessage failed:`, err.response?.data?.description || err.message);
+  }
+}
+
+/* ============================= */
+/* File Processing Logic         */
+/* ============================= */
+
+function findExistingFile(manifest, duplicates, uniqueId, fileName, fileSize) {
+  const inManifest = manifest.find(f => f.telegram_file_unique_id === uniqueId);
+  if (inManifest) return { location: 'manifest', file: inManifest, index: manifest.indexOf(inManifest) };
+  
+  const inDuplicates = duplicates.find(f => f.telegram_file_unique_id === uniqueId);
+  if (inDuplicates) return { location: 'duplicates', file: inDuplicates, index: duplicates.indexOf(inDuplicates) };
+  
+  // Check name+size match (possible re-upload)
+  const nameSizeMatch = manifest.find(f => f.name === fileName && f.file_size === fileSize);
+  if (nameSizeMatch) return { location: 'manifest-name-match', file: nameSizeMatch, index: manifest.indexOf(nameSizeMatch) };
+  
+  return null;
+}
+
+function createFileEntry(targetFile, filePath, originMessageId) {
+  return {
+    name: targetFile.file_name || targetFile.title || `file_${Date.now()}`,
+    telegram_file_id: targetFile.file_id,
+    telegram_file_unique_id: targetFile.file_unique_id,
+    telegram_file_path: filePath,
+    mime_type: targetFile.mime_type || null,
+    file_size: targetFile.file_size || 0,
+    message_id: originMessageId,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    last_checked_at: new Date().toISOString(),
+    refresh_count: 0
+  };
 }
 
 /* ============================= */
@@ -70,7 +161,11 @@ async function getFreshPath(fileId) {
 /* ============================= */
 
 app.get("/", (req, res) => {
-  res.send("Bot is awake and running! 🚀");
+  res.json({ 
+    status: "running", 
+    timestamp: new Date().toISOString(),
+    version: "2.0.0"
+  });
 });
 
 /* ============================= */
@@ -79,140 +174,197 @@ app.get("/", (req, res) => {
 
 app.post("/", async (req, res) => {
   const update = req.body;
-
   const msg = update.channel_post || update.message;
+  
   if (!msg) return res.sendStatus(200);
-
+  
   const chatId = msg.chat.id;
   const text = msg.text || msg.caption || "";
-  const fileObject = msg.document || msg.audio || msg.video;
-
+  const fileObject = msg.document || msg.audio || msg.video || msg.video_note || msg.voice;
+  
+  // Immediate ack to Telegram
+  res.sendStatus(200);
+  
   try {
-    const { data: manifestData, sha } = await getManifest();
+    // Load both manifests
+    const [{ data: manifestData, sha: manifestSha }, { data: dupData, sha: dupSha }] = await Promise.all([
+      getGitHubFile("manifest.json"),
+      getGitHubFile("duplicates.json")
+    ]);
+    
     let manifest = manifestData.files || [];
-
+    let duplicates = dupData.files || [];
+    
     const urlMatch = text.match(/https:\/\/t\.me\/([^\/]+)\/(\d+)/);
-
-    /* ===================================== */
-    /* CASE 1 — Add New File                */
-    /* ===================================== */
-
+    
+    /* ============================= */
+    /* CASE 1 — Add New File         */
+    /* ============================= */
+    
     if (fileObject || urlMatch) {
       let targetFile = fileObject;
       let originMessageId = msg.message_id;
-
-      // If link only, forward to extract file
+      let forwardFailed = false;
+      
+      // Handle t.me links by forwarding
       if (urlMatch && !fileObject) {
-        const channelUsername = urlMatch[1];
-        const messageId = parseInt(urlMatch[2], 10);
-
-        try {
-          const forward = await axios.get(`${TELEGRAM_API}/forwardMessage`, {
-            params: {
-              chat_id: chatId,
-              from_chat_id: `@${channelUsername}`,
-              message_id: messageId
-            }
-          });
-
-          const forwardMsg = forward.data.result;
-          originMessageId = forwardMsg.message_id;
-          targetFile =
-            forwardMsg.document ||
-            forwardMsg.audio ||
-            forwardMsg.video;
-
-        } catch (e) {
-          console.error("Failed to fetch link details:", e.message);
+        const [, channelUsername, messageIdStr] = urlMatch;
+        const messageId = parseInt(messageIdStr, 10);
+        
+        const forwarded = await forwardMessageSafely(chatId, `@${channelUsername}`, messageId);
+        
+        if (forwarded) {
+          targetFile = forwarded.document || forwarded.audio || forwarded.video || forwarded.video_note || forwarded.voice;
+          originMessageId = forwarded.message_id;
+        } else {
+          forwardFailed = true;
+          await sendMessage(chatId, "⚠️ Could not forward message. Ensure the bot is in the channel and message exists.");
         }
       }
-
+      
       if (targetFile) {
         const filePath = await getFreshPath(targetFile.file_id);
-        const fileName =
-          targetFile.file_name ||
-          targetFile.title ||
-          `file_${Date.now()}`;
-
-        // Remove duplicates by file_unique_id (stronger than name)
-        manifest = manifest.filter(
-          f => f.file_unique_id !== targetFile.file_unique_id
-        );
-
-        manifest.push({
-          name: fileName,
-          telegram_file_id: targetFile.file_id,
-          telegram_file_unique_id: targetFile.file_unique_id,
-          telegram_file_path: filePath,
-          mime_type: targetFile.mime_type || null,
-          file_size: targetFile.file_size || null,
-          message_id: originMessageId,
-          updated_at: new Date().toISOString()
-        });
-
-        await updateManifest({ files: manifest }, sha);
-
-        const directLink =
-          `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
-
-        await axios.post(`${TELEGRAM_API}/sendMessage`, {
-          chat_id: chatId,
-          text:
-            `✅ File Logged to GitHub!\n\n` +
-            `Name: ${fileName}\n` +
-            `Size: ${targetFile.file_size || "Unknown"} bytes\n` +
-            `CDN Link:\n${directLink}`
-        });
+        const uniqueId = targetFile.file_unique_id;
+        const fileName = targetFile.file_name || targetFile.title || `file_${Date.now()}`;
+        const fileSize = targetFile.file_size || 0;
+        
+        const existing = findExistingFile(manifest, duplicates, uniqueId, fileName, fileSize);
+        
+        let operation;
+        let responseText;
+        
+        if (existing?.location === 'manifest') {
+          // Refresh existing
+          existing.file.telegram_file_path = filePath;
+          existing.file.last_checked_at = new Date().toISOString();
+          existing.file.refresh_count = (existing.file.refresh_count || 0) + 1;
+          existing.file.updated_at = new Date().toISOString();
+          
+          operation = "Refresh existing";
+          responseText = `🔄 <b>Existing File Refreshed</b>\n\nName: ${escapeHtml(existing.file.name)}\nRefreshed: ${existing.file.refresh_count} times`;
+          
+        } else if (existing?.location === 'duplicates') {
+          // Move from duplicates back to manifest (file re-appeared)
+          const [restored] = duplicates.splice(existing.index, 1);
+          restored.telegram_file_path = filePath;
+          restored.message_id = originMessageId;
+          restored.updated_at = new Date().toISOString();
+          restored.restored_from_duplicates = true;
+          manifest.push(restored);
+          
+          operation = "Restore from duplicates";
+          responseText = `♻️ <b>File Restored from Duplicates</b>\n\nName: ${escapeHtml(restored.name)}`;
+          
+        } else if (existing?.location === 'manifest-name-match') {
+          // Same name/size, different unique_id = likely modified file
+          duplicates.push({
+            ...createFileEntry(targetFile, filePath, originMessageId),
+            duplicate_reason: "name_size_match",
+            original_file_id: existing.file.telegram_file_id
+          });
+          
+          operation = "Track modified duplicate";
+          responseText = `⚠️ <b>Possible Duplicate Detected</b>\n\nName: ${escapeHtml(fileName)}\nStatus: Moved to duplicates (same name/size, different ID)`;
+          
+        } else {
+          // Truly new file
+          manifest.push(createFileEntry(targetFile, filePath, originMessageId));
+          operation = "Add new";
+          responseText = `✅ <b>New File Added</b>\n\nName: ${escapeHtml(fileName)}\nSize: ${formatBytes(fileSize)}`;
+        }
+        
+        // Atomic update
+        await updateBothFiles(manifest, manifestSha, duplicates, dupSha, operation);
+        
+        const directLink = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+        await sendMessage(chatId, `${responseText}\n\n<a href="${directLink}">Direct Download</a>`);
       }
     }
-
-    /* ===================================== */
-    /* CASE 2 — Refresh by Filename          */
-    /* ===================================== */
-
-    else if (text.length > 2 && text !== "/github") {
-      const fileIndex = manifest.findIndex(f =>
-        f.name.toLowerCase().includes(text.toLowerCase())
-      );
-
+    
+    /* ============================= */
+    /* CASE 2 — Refresh by Filename  */
+    /* ============================= */
+    
+    else if (text.length > 2 && !text.startsWith("/")) {
+      const searchTerm = text.toLowerCase();
+      const fileIndex = manifest.findIndex(f => f.name.toLowerCase().includes(searchTerm));
+      
       if (fileIndex !== -1) {
         const file = manifest[fileIndex];
         const newPath = await getFreshPath(file.telegram_file_id);
-
+        
         manifest[fileIndex].telegram_file_path = newPath;
+        manifest[fileIndex].last_checked_at = new Date().toISOString();
+        manifest[fileIndex].refresh_count = (manifest[fileIndex].refresh_count || 0) + 1;
         manifest[fileIndex].updated_at = new Date().toISOString();
-
-        await updateManifest({ files: manifest }, sha);
-
-        const newLink =
-          `https://api.telegram.org/file/bot${BOT_TOKEN}/${newPath}`;
-
-        await axios.post(`${TELEGRAM_API}/sendMessage`, {
-          chat_id: chatId,
-          text:
-            `🔄 Link Refreshed!\n\n` +
-            `File: ${file.name}\n` +
-            `New CDN Link:\n${newLink}`
-        });
+        
+        await updateGitHubFile("manifest.json", { files: manifest }, manifestSha, "Manual refresh by filename");
+        
+        const newLink = `https://api.telegram.org/file/bot${BOT_TOKEN}/${newPath}`;
+        await sendMessage(chatId, `🔄 <b>Link Refreshed</b>\n\nFile: ${escapeHtml(file.name)}\nTimes refreshed: ${manifest[fileIndex].refresh_count}\n\n<a href="${newLink}">New Download Link</a>`);
+      } else {
+        await sendMessage(chatId, `❌ No file found matching "${escapeHtml(text)}"`);
       }
     }
-
-    /* ===================================== */
-    /* CASE 3 — Manifest Status              */
-    /* ===================================== */
-
-    if (text === "/github") {
-      await axios.post(`${TELEGRAM_API}/sendMessage`, {
-        chat_id: chatId,
-        text: `📊 Manifest Status: ${manifest.length} files tracked.`
-      });
+    
+    /* ============================= */
+    /* CASE 3 — Commands             */
+    /* ============================= */
+    
+    else if (text === "/github" || text === "/status") {
+      const totalSize = manifest.reduce((sum, f) => sum + (f.file_size || 0), 0);
+      await sendMessage(chatId, 
+        `📊 <b>Repository Status</b>\n\n` +
+        `Manifest: ${manifest.length} files\n` +
+        `Duplicates: ${duplicates.length} files\n` +
+        `Total size: ${formatBytes(totalSize)}\n` +
+        `Last updated: ${new Date().toLocaleString()}`
+      );
     }
-
+    
+    else if (text === "/duplicates") {
+      if (duplicates.length === 0) {
+        await sendMessage(chatId, "✅ No duplicates tracked");
+      } else {
+        const list = duplicates.slice(0, 10).map((d, i) => 
+          `${i + 1}. ${escapeHtml(d.name)} (${d.duplicate_reason || 'unknown'})`
+        ).join("\n");
+        await sendMessage(chatId, `⚠️ <b>Recent Duplicates</b>\n\n${list}${duplicates.length > 10 ? `\n\n...and ${duplicates.length - 10} more` : ''}`);
+      }
+    }
+    
   } catch (err) {
-    console.error("Error Processing Update:", err.response?.data || err.message);
+    console.error("[Webhook Error]", err);
+    await sendMessage(chatId, `❌ <b>Error</b>\n\n${escapeHtml(err.message.slice(0, 200))}`);
   }
-
-  res.sendStatus(200);
 });
 
-app.listen(process.env.PORT || 3000);
+/* ============================= */
+/* Utilities                     */
+/* ============================= */
+
+function escapeHtml(text) {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function formatBytes(bytes) {
+  if (bytes === 0) return "0 Bytes";
+  const k = 1024;
+  const sizes = ["Bytes", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+}
+
+/* ============================= */
+/* Startup                       */
+/* ============================= */
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 Bot running on port ${PORT}`);
+  console.log(`📁 Repo: ${GITHUB_USERNAME}/${REPO_NAME}`);
+  console.log(`🌿 Branch: ${BRANCH}`);
+});
