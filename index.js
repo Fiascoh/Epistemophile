@@ -41,59 +41,73 @@ async function getFreshPath(fileId) {
   return res.data.result.file_path;
 }
 
-// This handles the "GET" request from your browser or Cron-job.org
+// Health check for Cron-job.org or Browser
 app.get("/", (req, res) => {
   res.send("Bot is awake and running! 🚀");
 });
 
 app.post("/", async (req, res) => {
   const update = req.body;
-  if (!update.message) return res.sendStatus(200);
 
-  const chatId = update.message.chat.id;
-  const text = update.message.text || "";
-  const { data: manifestData, sha } = await getManifest();
-  let manifest = manifestData.files || [];
+  // IMPORTANT: Look for 'channel_post' if the bot is in a channel
+  const msg = update.channel_post || update.message;
+  if (!msg) return res.sendStatus(200);
+
+  const chatId = msg.chat.id;
+  // Files in channels usually have a 'caption', text messages have 'text'
+  const text = msg.text || msg.caption || ""; 
+  const fileObject = msg.document || msg.audio || msg.video;
 
   try {
+    const { data: manifestData, sha } = await getManifest();
+    let manifest = manifestData.files || [];
+
     const urlMatch = text.match(/https:\/\/t\.me\/([^\/]+)\/(\d+)/);
 
-    // CASE 1: Adding a new file via Link
-    if (urlMatch) {
-      const channelUsername = urlMatch[1];
-      const messageId = parseInt(urlMatch[2], 10);
+    // CASE 1: Adding a new file (Direct Upload OR Link)
+    if (fileObject || urlMatch) {
+      let targetFile = fileObject;
 
-      const chatInfo = await axios.get(`${TELEGRAM_API}/getChat?chat_id=@${channelUsername}`);
-      const forward = await axios.get(`${TELEGRAM_API}/forwardMessage`, {
-        params: { chat_id: chatId, from_chat_id: chatInfo.data.result.id, message_id: messageId }
-      });
+      // If we only have a link, we need to fetch the file details first
+      if (urlMatch && !fileObject) {
+        const channelUsername = urlMatch[1];
+        const messageId = parseInt(urlMatch[2], 10);
+        
+        try {
+          const forward = await axios.get(`${TELEGRAM_API}/forwardMessage`, {
+            params: { chat_id: chatId, from_chat_id: `@${channelUsername}`, message_id: messageId }
+          });
+          const forwardMsg = forward.data.result;
+          targetFile = forwardMsg.document || forwardMsg.audio || forwardMsg.video;
+        } catch (e) {
+          console.error("Failed to fetch link details:", e.message);
+        }
+      }
 
-      const msg = forward.data.result;
-      const fileObject = msg.document || msg.audio || msg.video;
+      if (targetFile) {
+        const filePath = await getFreshPath(targetFile.file_id);
+        const fileName = targetFile.file_name || targetFile.title || "Unknown_File";
 
-      if (fileObject) {
-        const filePath = await getFreshPath(fileObject.file_id);
-        const fileName = fileObject.file_name || fileObject.title || "Unknown";
-
-        // Remove old entry if exists to avoid duplicates
+        // Filter out existing file with same name to avoid duplicates
         manifest = manifest.filter(f => f.name !== fileName);
         
         manifest.push({
           name: fileName,
-          telegram_file_id: fileObject.file_id,
+          telegram_file_id: targetFile.file_id,
           telegram_file_path: filePath,
           updated_at: new Date().toISOString()
         });
 
         await updateManifest({ files: manifest }, sha);
+        
         const directLink = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
         await axios.post(`${TELEGRAM_API}/sendMessage`, {
           chat_id: chatId,
-          text: `✅ File Saved/Updated!\n\nName: ${fileName}\nNew Link: ${directLink}`
+          text: `✅ File Logged to GitHub!\n\nName: ${fileName}\nCDN Link: ${directLink}`
         });
       }
     } 
-    // CASE 2: Refreshing an existing file by sending its NAME
+    // CASE 2: Refreshing by Filename (Search manifest for name match)
     else if (text.length > 2 && text !== "/github") {
       const fileIndex = manifest.findIndex(f => f.name.toLowerCase().includes(text.toLowerCase()));
 
@@ -117,12 +131,12 @@ app.post("/", async (req, res) => {
     if (text === "/github") {
       await axios.post(`${TELEGRAM_API}/sendMessage`, {
         chat_id: chatId,
-        text: `📊 Manifest has ${manifest.length} files.`
+        text: `📊 Manifest Status: ${manifest.length} files tracked.`
       });
     }
 
   } catch (err) {
-    console.error("Error:", err.message);
+    console.error("Error Processing Update:", err.response?.data || err.message);
   }
   res.sendStatus(200);
 });
