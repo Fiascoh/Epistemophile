@@ -10,6 +10,11 @@ const GITHUB_USERNAME = process.env.GITHUB_USERNAME;
 const REPO_NAME = process.env.REPO_NAME;
 const BRANCH = "main";
 
+// Validate environment variables
+if (!BOT_TOKEN || !GITHUB_TOKEN || !GITHUB_USERNAME || !REPO_NAME) {
+    throw new Error("Missing required environment variables: BOT_TOKEN, GITHUB_TOKEN, GITHUB_USERNAME, REPO_NAME");
+}
+
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 app.post("/", async (req, res) => {
@@ -29,7 +34,7 @@ app.post("/", async (req, res) => {
 
         if (match) {
             const channelUsername = match[1];
-            const messageId = parseInt(match[2]);
+            const messageId = parseInt(match[2], 10);
 
             const chatInfo = await axios.get(
                 `${TELEGRAM_API}/getChat?chat_id=@${channelUsername}`
@@ -69,6 +74,11 @@ app.post("/", async (req, res) => {
                     chat_id: chatId,
                     text: `File ID:\n${fileId}\n\nDirect Link:\n${directLink}`
                 });
+            } else {
+                await axios.post(`${TELEGRAM_API}/sendMessage`, {
+                    chat_id: chatId,
+                    text: "No file found in that message."
+                });
             }
         }
 
@@ -93,11 +103,15 @@ app.post("/", async (req, res) => {
 
     } catch (err) {
         console.error(err);
+        await axios.post(`${TELEGRAM_API}/sendMessage`, {
+            chat_id: chatId,
+            text: "An error occurred while processing your request."
+        });
     }
 
     res.sendStatus(200);
 });
 
-app.listen(process.env.PORT, () => {
+app.listen(process.env.PORT || 3000, () => {
     console.log("Server running");
 });
