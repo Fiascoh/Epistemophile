@@ -1,13 +1,10 @@
 {
-  "name": "telegram-bot",
-  "version": "1.0.0",
-  "description": "A Telegram bot application",
-  "main": "index.js",
-  "type": "module",
-  "dependencies": {
-    "express": "^4.18.2",
-    "axios": "^1.6.0"
-  },
-  "author": "Fiascoh",
-  "license": "MIT"
+  "files": [
+    {
+      "name": "A",
+      "telegram_file_id": "BQACAgQAAyEFAATlqCwhAAMKaac3dh3kNxhVnKGQLWT6diJma2YAAqUfAALq-DhRY1tmfejHJWs6BA",
+      "telegram_file_path": "documents/file_0",
+      "updated_at": "2026-03-03T19:33:12.333Z"
+    }
+  ]
 }
